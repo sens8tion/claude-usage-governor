@@ -14,6 +14,21 @@ files, which is what tools like `ccusage` do. It calls the same endpoint the
 CLI itself calls, and reports the same `utilization` number `/usage` shows
 you — the one that actually determines when you get cut off.
 
+## Give this to a Claude Code session
+
+Paste this verbatim into any session — new or already mid-task, doesn't
+matter — to have it install this tool and self-pace against your plan limit
+for the rest of that session:
+
+> Clone https://github.com/sens8tion/claude-usage-governor, set it up per
+> `CLAUDE.md`, and follow `docs/operating-directive.md` from here on.
+
+Say just "clone this: `<url>`" and a session may treat it as reference
+material rather than something to act on — the phrasing above forces both
+the install step and the standing self-pacing behavior; the first alone
+(`CLAUDE.md`) sets the tool up but doesn't change how the session behaves
+afterward.
+
 ## The two jobs
 
 **Reader** — `claude-usage-governor`, `--json`, or `--quiet`. Prints
