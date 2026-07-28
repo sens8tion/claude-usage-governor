@@ -1,0 +1,22 @@
+claude-usage-governor
+Copyright 2026 sens8tion
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+This project talks to an undocumented Anthropic endpoint
+(`/api/oauth/usage`) discovered by reading the public `@anthropic-ai/claude-code`
+CLI's own bundled source. It is not an official Anthropic tool, is not
+endorsed by Anthropic, and may break without notice on any Claude Code
+update. See README.md, "How this works and its risks."
