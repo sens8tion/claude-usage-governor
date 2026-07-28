@@ -49,6 +49,35 @@ exactly where you stopped and why), and pause starting anything new. Re-check
 headroom every few minutes — resume the moment it clears your conservative
 band, don't wait for a fixed reset time.
 
+## Adjusting your band with the rate projection
+
+`--json` also carries a `projection` object per window (`null` until enough
+history exists — usually after your first couple of checks in this session).
+It answers the sharper question the raw `remaining` percentage can't: at your
+*current burn rate*, are you trending toward the wall or comfortably below
+it, indefinitely? Use `projection.fanout_multiplier` (already capped to a
+sane range server-side by the tool) to nudge your effective band:
+
+- **`fanout_multiplier` ≥ 2** — you're well under the sustainable rate for
+  this window. Treat yourself as one band healthier than raw `remaining`
+  alone suggests (but never promote yourself above the ≥ 50% band). A
+  session sitting at 30% remaining but burning far below the sustainable
+  rate can safely keep fanning out at full width.
+- **`fanout_multiplier` < 1** — `will_hit_limit_at_current_rate` is true: at
+  this pace you trend toward the wall no matter how much headroom you have
+  *right now*. Treat yourself as one band worse than raw `remaining`
+  suggests, even in the ≥ 50% band — a fast-burning session at 70% remaining
+  is a nearer-term problem than a slow-burning one at 30%.
+- **`projection` is `null`** — not enough history yet. Fall back to the
+  plain `remaining`-based bands above; don't guess at a trend from a single
+  reading.
+
+This is a trailing average, not a hard signal — a sudden fan-out burst can
+spike well past it before the next check catches up. Use it to widen or
+narrow your default, never to override the hook's hard floor, and never as a
+reason to skip a `remaining`-based check just because a stale projection once
+looked healthy.
+
 ## Model selection: least viable, not cheapest by default
 
 For every subagent or Workflow `agent()` call, ask: what is the cheapest tier

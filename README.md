@@ -57,16 +57,56 @@ Example output:
 Current session (5h)
   [####........................]  84.0% left  (16.0% used)
   resets Tue 06:59 - in 4h 59m
+  rate: 3.20%/h of 20.00%/h sustainable - at this rate you will stay under the limit (~16% steady-state) - fan-out up to 4.0x
 
 Current week (all models)
   [####........................]  84.0% left  (16.0% used)
   resets Tue 03:59 - in 60m
+  rate: not enough history yet
 
 Binding limit: Current week (all models) - 84% left
 ```
 
 If you've never run `/usage` won't show anything either — usage data is only
 available on subscription plans, not API-key/console billing.
+
+## Rate projection: "at this rate, will I ever hit the limit?"
+
+Every fresh fetch is appended to a small local history file
+(`~/.claude/usage-governor/history.jsonl`: just `{timestamp, percent}` per
+window, nothing else). Once there are a couple of samples spread over time,
+each window in `--json` output gets a `projection`:
+
+```json
+{
+  "rate_pct_per_hour": 3.2,
+  "sustainable_rate_pct_per_hour": 20.0,
+  "projected_steady_state_pct": 16.0,
+  "will_hit_limit_at_current_rate": false,
+  "fanout_multiplier": 4.0
+}
+```
+
+The windows are **sliding**, not fixed-and-reset (see above), which is what
+makes this projection well-defined: if a rate is sustained forever, headroom
+converges toward a steady state — `rate * window_length_hours`, capped at
+100% — instead of ever cleanly "resetting." Below `100 / window_length_hours`
+(the sustainable rate: 20%/h for the 5h session window, ~0.6%/h for the 7-day
+weekly window), you converge under the cap and genuinely never hit it, no
+matter how long you keep going. Above it, you trend toward the cap regardless
+of how much headroom you currently have. `fanout_multiplier` is
+`sustainable_rate / current_rate`, capped at `fanout_multiplier_cap` (default
+4x) — roughly, "you could sustain up to this much more throughput and still
+never trend toward the wall."
+
+Caveats, stated plainly: this is a trailing average, not a crystal ball. A
+sudden fan-out burst can spike well above it before the next sample catches
+up. `projection` is `null` until there are at least two samples in the
+lookback window (`lookback_fraction * window_length`, default the trailing
+25%) — nothing is fabricated from a single reading. Treat it as "safe to
+widen your default," never as a substitute for the hard-floor brake, which
+stays purely reactive and unaffected by any of this (see
+[Wiring in the hook](#wiring-in-the-hook)).
 
 ## Wiring in the hook
 
@@ -116,7 +156,10 @@ defaults):
   "fanout_tools": ["Agent", "Task", "Workflow"],
   "watch_kinds": ["session", "weekly_all", "weekly_scoped"],
   "cache_seconds": 60,
-  "decision": "ask"
+  "decision": "ask",
+  "lookback_fraction": 0.25,
+  "history_retention_hours": 48.0,
+  "fanout_multiplier_cap": 4.0
 }
 ```
 
@@ -129,6 +172,21 @@ defaults):
 - **`watch_kinds`** — which of the API's rate-limit windows the hook
   considers. `session` is the 5h window; `weekly_all` is the 7-day cap;
   `weekly_scoped` covers model-specific weekly caps when active.
+- **`lookback_fraction`** — the rate projection (below) measures trend over
+  the trailing `window_length * lookback_fraction` hours: 75 minutes for the
+  5h session window, ~42 hours for the 7-day weekly window, at the default.
+- **`history_retention_hours`** — how long raw samples are kept before being
+  pruned. Must stay larger than the longest lookback in use.
+- **`fanout_multiplier_cap`** — ceiling on the reported fan-out multiplier,
+  so a very low or still-thin measured rate doesn't project an enormous or
+  unbounded number.
+
+The hook's own throttle decision (above) stays purely floor-based and does
+**not** consume the rate projection — it only records history in the
+background so `--json` has data to work with. Keeping the brake's decision
+rule simple and reactive is deliberate; the projection is for a session's own
+judgment (see the operating directive below), not an input to the automatic
+block.
 
 ## Pacing a long session: the operating directive
 
@@ -136,10 +194,18 @@ The hook is a backstop, not a pacing strategy — it only fires once you're
 already close to a floor. [`docs/operating-directive.md`](docs/operating-directive.md)
 is a standing instruction you can paste into a session (or pass via
 `claude --append-system-prompt`, or drive with `/loop`) that has the session
-police its *own* pace continuously: checking headroom before fanning out,
-downshifting model tier and fan-out width as headroom drops, and checkpointing
-work rather than idling when it gets low — so the hook rarely needs to fire
-at all.
+police its *own* pace continuously: checking headroom (and the rate
+projection above) before fanning out, downshifting model tier and fan-out
+width as headroom drops or the projection turns unfavorable, and
+checkpointing work rather than idling when it gets low — so the hook rarely
+needs to fire at all.
+
+### For a Claude Code session reading this repo cold
+
+If you're a Claude Code session that's been pointed at this repo without
+further explanation: [`CLAUDE.md`](CLAUDE.md) is written for exactly that —
+read it first, it tells you what to set up and how to use this tool without
+needing anything else from whoever handed you the repo.
 
 ## How this works, and its risks
 

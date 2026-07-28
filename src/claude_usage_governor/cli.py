@@ -16,6 +16,19 @@ Two jobs in one tool:
            slamming into the 5h wall. Fails OPEN: any error at all allows
            the tool through.
 
+Every fresh (non-cached) fetch is also appended to a small local history file,
+which lets the reader project a RATE (%/hour of quota) and answer "at this
+rate of token use, will I ever hit the limit" -- see `project()` below. That
+question only has a sane answer because the windows are SLIDING, not
+fixed-and-reset: if a constant rate is sustained forever, utilization
+asymptotically approaches `rate * window_length_hours`, capped at 100%. Below
+`100 / window_length_hours` (the sustainable rate), you converge under the
+cap and never hit it, however long you keep going; above it, you trend
+toward the cap regardless of how much headroom you have right now. That
+steady-state framing is the correct one here -- "hours until reset" is not,
+because headroom keeps returning throughout, continuously, as old usage ages
+out from under the window.
+
 The 5h window SLIDES. Headroom returns continuously as old usage ages out;
 it does not all come back at once at `resets_at`. So the brake never sleeps
 until the reset time -- it re-polls (subject to its own cache) and releases
@@ -46,6 +59,7 @@ CRED_PATH = CLAUDE_HOME / ".credentials.json"
 STATE_DIR = Path(os.environ.get("CLAUDE_USAGE_GOVERNOR_HOME", CLAUDE_HOME / "usage-governor"))
 CACHE_PATH = STATE_DIR / "cache.json"
 CONFIG_PATH = STATE_DIR / "config.json"
+HISTORY_PATH = STATE_DIR / "history.jsonl"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # Below this much headroom on a watched window, throttle every tool.
@@ -64,11 +78,35 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # would fix the config. Only use "deny" if you have another way to edit
     # this file (e.g. a second terminal) when locked out.
     "decision": "ask",
+    # The rate trend is measured over the trailing (window_length * this
+    # fraction) hours -- e.g. 0.25 means the last 75 minutes for the 5h
+    # session window, the last ~42 hours for the 7-day weekly window. Short
+    # enough to reflect a recent change in pace, long enough to not be one
+    # or two noisy samples.
+    "lookback_fraction": 0.25,
+    # How long raw samples are kept before being pruned from history.jsonl.
+    # Must exceed the longest lookback actually used (168h * 0.25 = 42h), so
+    # the default has headroom for a larger lookback_fraction too.
+    "history_retention_hours": 48.0,
+    # A cap on the reported fan-out multiplier. Without one, a very low or
+    # negative measured rate (still-thin history, or a genuinely idle
+    # stretch) would project an enormous or infinite multiplier -- true in
+    # the math, misleading in practice, since a fan-out burst can spike well
+    # above any trailing average before the next sample catches it.
+    "fanout_multiplier_cap": 4.0,
 }
 
 WINDOW_TITLES = {
     "session": "Current session (5h)",
     "weekly_all": "Current week (all models)",
+}
+
+# Fixed window lengths the API's `kind` values correspond to. Used to derive
+# the sustainable rate (100% / length) and the steady-state projection.
+WINDOW_LENGTH_HOURS = {
+    "session": 5.0,
+    "weekly_all": 24.0 * 7,
+    "weekly_scoped": 24.0 * 7,
 }
 
 # Legacy top-level response shape, used only if `limits[]` is absent.
@@ -243,6 +281,122 @@ def countdown(resets_at: Any) -> str | None:
     return f"{int(secs // 60)}m"
 
 
+# --------------------------------------------------------------------------- rate history
+
+
+def _load_history() -> list[dict[str, Any]]:
+    if not HISTORY_PATH.exists():
+        return []
+    out = []
+    for line in HISTORY_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue  # a corrupt line must not lose every other line
+    return out
+
+
+def record_history(windows: list[dict[str, Any]], retention_hours: float, ts: float) -> None:
+    """Append one sample (percent per watched window kind, at `ts`) and prune
+    anything older than `retention_hours`. History is advisory -- a write
+    failure here must never break the primary read or hook path."""
+    if not windows:
+        return
+    sample = {"ts": ts, "windows": {w["kind"]: w["percent"] for w in windows if w.get("kind")}}
+    try:
+        cutoff = ts - retention_hours * 3600
+        history = [h for h in _load_history() if h.get("ts", 0) >= cutoff]
+        history.append(sample)
+        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        HISTORY_PATH.write_text(
+            "\n".join(json.dumps(h) for h in history) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def compute_rate(history: list[dict[str, Any]], kind: str, now_ts: float,
+                  lookback_hours: float) -> float | None:
+    """Least-squares slope of percent-vs-time for `kind`, in percent per
+    hour, using samples within `lookback_hours` of `now_ts`. None if there
+    are fewer than two samples, or they're all at the same instant -- not
+    enough spread to measure a trend rather than a coincidence."""
+    cutoff = now_ts - lookback_hours * 3600
+    points = [
+        (h["ts"], h["windows"][kind])
+        for h in history
+        if isinstance(h.get("windows"), dict)
+        and h["windows"].get(kind) is not None
+        and h.get("ts", 0) >= cutoff
+    ]
+    if len(points) < 2:
+        return None
+
+    n = len(points)
+    mean_t = sum(t for t, _ in points) / n
+    mean_p = sum(p for _, p in points) / n
+    denom = sum((t - mean_t) ** 2 for t, _ in points)
+    if denom == 0:
+        return None
+    numer = sum((t - mean_t) * (p - mean_p) for t, p in points)
+    return (numer / denom) * 3600.0  # percent per second -> percent per hour
+
+
+def project(kind: str, current_percent: float, rate_pct_per_hour: float | None,
+            multiplier_cap: float) -> dict[str, Any] | None:
+    """Steady-state projection for a SLIDING window: if `rate_pct_per_hour`
+    were sustained indefinitely, utilization asymptotically approaches
+    `rate * window_length_hours` (capped at 100). That -- not "hours until
+    reset" -- is the question that actually has a stable answer for a window
+    where headroom keeps returning continuously. None if the window's length
+    isn't known, or there's not yet enough history to measure a rate."""
+    length = WINDOW_LENGTH_HOURS.get(kind)
+    if length is None or rate_pct_per_hour is None:
+        return None
+
+    sustainable = 100.0 / length
+
+    if rate_pct_per_hour <= 0:
+        # Flat or declining: utilization will not exceed where it is now.
+        return {
+            "rate_pct_per_hour": round(rate_pct_per_hour, 3),
+            "sustainable_rate_pct_per_hour": round(sustainable, 3),
+            "projected_steady_state_pct": round(current_percent, 1),
+            "will_hit_limit_at_current_rate": False,
+            "fanout_multiplier": multiplier_cap,
+        }
+
+    steady_state = min(100.0, rate_pct_per_hour * length)
+    multiplier = min(multiplier_cap, sustainable / rate_pct_per_hour)
+    return {
+        "rate_pct_per_hour": round(rate_pct_per_hour, 3),
+        "sustainable_rate_pct_per_hour": round(sustainable, 3),
+        "projected_steady_state_pct": round(steady_state, 1),
+        "will_hit_limit_at_current_rate": steady_state >= 100.0,
+        "fanout_multiplier": round(multiplier, 2),
+    }
+
+
+def enrich_with_projections(windows: list[dict[str, Any]], config: dict[str, Any],
+                             now_ts: float) -> None:
+    """Mutates each window dict in place, adding a `projection` key (a dict,
+    or None when there isn't yet enough history for that window's kind)."""
+    history = _load_history()
+    fraction = float(config["lookback_fraction"])
+    cap = float(config["fanout_multiplier_cap"])
+    for w in windows:
+        kind = w.get("kind")
+        length = WINDOW_LENGTH_HOURS.get(kind)
+        rate = None
+        if length is not None:
+            lookback = max(0.05, length * fraction)
+            rate = compute_rate(history, kind, now_ts, lookback)
+        w["projection"] = project(kind, w["percent"], rate, cap)
+
+
 def load_config() -> dict[str, Any]:
     config = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
@@ -272,6 +426,21 @@ def report(windows: list[dict[str, Any]], data: dict[str, Any], colour: bool) ->
         if left:
             reset = parse_reset(w["resets_at"]).astimezone()
             print(paint(f"  resets {reset:%a %H:%M} - in {left}", "90"))
+
+        proj = w.get("projection")
+        if proj is None:
+            print(paint("  rate: not enough history yet", "90"))
+        elif proj["rate_pct_per_hour"] <= 0:
+            print(paint(
+                f"  rate: {proj['rate_pct_per_hour']:+.2f}%/h (flat or declining) "
+                f"- fan-out up to {proj['fanout_multiplier']:.1f}x", "90"))
+        else:
+            hit = "WILL trend toward the limit" if proj["will_hit_limit_at_current_rate"] \
+                else "will stay under the limit"
+            print(paint(
+                f"  rate: {proj['rate_pct_per_hour']:.2f}%/h of {proj['sustainable_rate_pct_per_hour']:.2f}%/h "
+                f"sustainable - at this rate you {hit} (~{proj['projected_steady_state_pct']:.0f}% "
+                f"steady-state) - fan-out up to {proj['fanout_multiplier']:.1f}x", "90"))
         print()
 
     extra = data.get("extra_usage")
@@ -303,6 +472,12 @@ def run_hook(config: dict[str, Any]) -> int:
     try:
         usage = get_usage(int(config["cache_seconds"]))
         windows = extract_windows(usage["data"])
+        if not usage["from_cache"]:
+            # Keep collecting rate history even when only the hook runs, so
+            # the reader's --json projection has data without needing to be
+            # invoked separately. The hook's own throttle decision below
+            # stays purely floor-based -- see README, "Decision: ask vs deny".
+            record_history(windows, float(config["history_retention_hours"]), usage["fetched_at"])
     except (UsageError, KeyError, ValueError, OSError):
         return 0  # cannot measure -> allow
 
@@ -377,6 +552,10 @@ def main(argv: list[str] | None = None) -> int:
         print("error: no rate-limit windows returned; usage data is only "
               "available on subscription plans.", file=sys.stderr)
         return 1
+
+    if not usage["from_cache"]:
+        record_history(windows, float(config["history_retention_hours"]), usage["fetched_at"])
+    enrich_with_projections(windows, config, time.time())
 
     binding = min(windows, key=lambda w: w["remaining"])
 

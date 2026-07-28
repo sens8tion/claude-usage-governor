@@ -167,7 +167,11 @@ def test_load_config_corrupt_file_falls_back(monkeypatch, tmp_path):
 def _usage_payload(percent: float) -> dict:
     return {"data": {"limits": [{"kind": "session", "percent": percent,
                                   "resets_at": None}]},
-            "token_source": "test", "fetched_at": 0}
+            "token_source": "test", "fetched_at": 0,
+            # from_cache=True -- these tests exercise the throttle decision,
+            # not history recording (see the dedicated rate-history tests),
+            # so skip the real filesystem write run_hook does on a fresh fetch.
+            "from_cache": True}
 
 
 def _invoke_hook(monkeypatch, capsys, tool_name: str, percent: float, config: dict):
@@ -230,6 +234,178 @@ def test_hook_fails_open_when_usage_unavailable(monkeypatch, capsys):
     rc = cli.run_hook(dict(cli.DEFAULT_CONFIG))
     assert rc == 0
     assert capsys.readouterr().out == ""
+
+
+# --------------------------------------------------------------------------- rate history
+
+
+def test_load_history_missing_file_returns_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "HISTORY_PATH", tmp_path / "missing.jsonl")
+    assert cli._load_history() == []
+
+
+def test_load_history_skips_corrupt_lines(monkeypatch, tmp_path):
+    path = tmp_path / "history.jsonl"
+    path.write_text('{"ts": 1, "windows": {"session": 10}}\nnot json\n', encoding="utf-8")
+    monkeypatch.setattr(cli, "HISTORY_PATH", path)
+    history = cli._load_history()
+    assert len(history) == 1
+    assert history[0]["windows"]["session"] == 10
+
+
+def test_record_history_appends_and_prunes(monkeypatch, tmp_path):
+    path = tmp_path / "history.jsonl"
+    monkeypatch.setattr(cli, "HISTORY_PATH", path)
+
+    old_sample = [{"kind": "session", "percent": 5.0}]
+    cli.record_history(old_sample, retention_hours=1.0, ts=1000.0)
+
+    # Well past the 1h retention window relative to the next sample.
+    new_sample = [{"kind": "session", "percent": 8.0}]
+    cli.record_history(new_sample, retention_hours=1.0, ts=1000.0 + 3 * 3600)
+
+    history = cli._load_history()
+    assert len(history) == 1  # the old sample was pruned
+    assert history[0]["windows"]["session"] == 8.0
+
+
+def test_record_history_ignores_windows_without_kind(monkeypatch, tmp_path):
+    path = tmp_path / "history.jsonl"
+    monkeypatch.setattr(cli, "HISTORY_PATH", path)
+    cli.record_history([{"kind": None, "percent": 5.0}], retention_hours=1.0, ts=1000.0)
+    history = cli._load_history()
+    assert history[0]["windows"] == {}
+
+
+def test_record_history_write_failure_does_not_raise(monkeypatch, tmp_path):
+    # HISTORY_PATH's parent is a file, not a directory -- mkdir must fail.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(cli, "HISTORY_PATH", blocker / "sub" / "history.jsonl")
+    cli.record_history([{"kind": "session", "percent": 5.0}], retention_hours=1.0, ts=1000.0)  # no raise
+
+
+# --------------------------------------------------------------------------- compute_rate
+
+
+def test_compute_rate_needs_two_points():
+    history = [{"ts": 1000.0, "windows": {"session": 10.0}}]
+    assert cli.compute_rate(history, "session", now_ts=1000.0, lookback_hours=1.0) is None
+
+
+def test_compute_rate_simple_linear_increase():
+    # +10% over 1 hour -> 10%/hour.
+    history = [
+        {"ts": 0.0, "windows": {"session": 10.0}},
+        {"ts": 3600.0, "windows": {"session": 20.0}},
+    ]
+    rate = cli.compute_rate(history, "session", now_ts=3600.0, lookback_hours=2.0)
+    assert rate == pytest.approx(10.0, abs=0.01)
+
+
+def test_compute_rate_declining():
+    history = [
+        {"ts": 0.0, "windows": {"session": 30.0}},
+        {"ts": 3600.0, "windows": {"session": 20.0}},
+    ]
+    rate = cli.compute_rate(history, "session", now_ts=3600.0, lookback_hours=2.0)
+    assert rate == pytest.approx(-10.0, abs=0.01)
+
+
+def test_compute_rate_ignores_samples_outside_lookback():
+    history = [
+        {"ts": -100000.0, "windows": {"session": 999.0}},  # far outside lookback
+        {"ts": 0.0, "windows": {"session": 10.0}},
+        {"ts": 3600.0, "windows": {"session": 20.0}},
+    ]
+    rate = cli.compute_rate(history, "session", now_ts=3600.0, lookback_hours=2.0)
+    assert rate == pytest.approx(10.0, abs=0.01)
+
+
+def test_compute_rate_ignores_other_window_kinds():
+    history = [
+        {"ts": 0.0, "windows": {"weekly_all": 50.0}},
+        {"ts": 3600.0, "windows": {"weekly_all": 60.0}},
+    ]
+    assert cli.compute_rate(history, "session", now_ts=3600.0, lookback_hours=2.0) is None
+
+
+def test_compute_rate_all_same_timestamp_returns_none():
+    history = [
+        {"ts": 100.0, "windows": {"session": 10.0}},
+        {"ts": 100.0, "windows": {"session": 20.0}},
+    ]
+    assert cli.compute_rate(history, "session", now_ts=100.0, lookback_hours=1.0) is None
+
+
+# --------------------------------------------------------------------------- project
+
+
+def test_project_unknown_kind_returns_none():
+    assert cli.project("mystery", 10.0, rate_pct_per_hour=1.0, multiplier_cap=4.0) is None
+
+
+def test_project_no_rate_returns_none():
+    assert cli.project("session", 10.0, rate_pct_per_hour=None, multiplier_cap=4.0) is None
+
+
+def test_project_flat_rate_never_hits_limit():
+    result = cli.project("session", current_percent=42.0, rate_pct_per_hour=0.0, multiplier_cap=4.0)
+    assert result["will_hit_limit_at_current_rate"] is False
+    assert result["projected_steady_state_pct"] == 42.0
+    assert result["fanout_multiplier"] == 4.0  # capped, since rate isn't > 0
+
+
+def test_project_declining_rate_never_hits_limit():
+    result = cli.project("session", current_percent=42.0, rate_pct_per_hour=-2.0, multiplier_cap=4.0)
+    assert result["will_hit_limit_at_current_rate"] is False
+
+
+def test_project_sustainable_rate_stays_under_limit():
+    # Session window: sustainable rate is 100/5 = 20%/h. At exactly that
+    # rate, steady state is exactly 100 -- the boundary counts as "will hit".
+    result = cli.project("session", current_percent=16.0, rate_pct_per_hour=10.0, multiplier_cap=4.0)
+    assert result["sustainable_rate_pct_per_hour"] == pytest.approx(20.0)
+    assert result["projected_steady_state_pct"] == pytest.approx(50.0)  # 10 * 5h
+    assert result["will_hit_limit_at_current_rate"] is False
+    assert result["fanout_multiplier"] == pytest.approx(2.0)  # 20/10
+
+
+def test_project_unsustainable_rate_will_hit_limit():
+    result = cli.project("session", current_percent=16.0, rate_pct_per_hour=30.0, multiplier_cap=4.0)
+    assert result["projected_steady_state_pct"] == 100.0  # capped, 30*5=150 -> 100
+    assert result["will_hit_limit_at_current_rate"] is True
+    assert result["fanout_multiplier"] < 1.0  # 20/30
+
+
+def test_project_multiplier_is_capped():
+    # A tiny positive rate would imply a huge multiplier without the cap.
+    result = cli.project("session", current_percent=1.0, rate_pct_per_hour=0.01, multiplier_cap=4.0)
+    assert result["fanout_multiplier"] == 4.0
+
+
+# --------------------------------------------------------------------------- enrich_with_projections
+
+
+def test_enrich_with_projections_adds_projection_key(monkeypatch, tmp_path):
+    path = tmp_path / "history.jsonl"
+    monkeypatch.setattr(cli, "HISTORY_PATH", path)
+    cli.record_history([{"kind": "session", "percent": 10.0}], retention_hours=1.0, ts=0.0)
+    cli.record_history([{"kind": "session", "percent": 20.0}], retention_hours=1.0, ts=3600.0)
+
+    windows = [{"kind": "session", "percent": 20.0}]
+    config = dict(cli.DEFAULT_CONFIG)
+    cli.enrich_with_projections(windows, config, now_ts=3600.0)
+
+    assert windows[0]["projection"] is not None
+    assert windows[0]["projection"]["rate_pct_per_hour"] == pytest.approx(10.0, abs=0.01)
+
+
+def test_enrich_with_projections_none_when_kind_unknown(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "HISTORY_PATH", tmp_path / "history.jsonl")
+    windows = [{"kind": "mystery", "percent": 20.0}]
+    cli.enrich_with_projections(windows, dict(cli.DEFAULT_CONFIG), now_ts=0.0)
+    assert windows[0]["projection"] is None
 
 
 if __name__ == "__main__":
