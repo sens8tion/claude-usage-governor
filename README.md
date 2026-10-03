@@ -141,11 +141,29 @@ Add to `~/.claude/settings.json` (see
 }
 ```
 
-The hook is cheap by design — it caches the usage fetch (60s by default) so
+The hook is cheap by design — it caches the usage fetch (150s by default) so
 it doesn't hit the network on every single tool call, and it **fails open**:
 any error at all (network failure, expired token, malformed config) allows
 the tool through. A broken sensor must never be the thing that strands a
 session.
+
+### The usage endpoint is itself rate-limited
+
+`/api/oauth/usage` answers `429` when polled too often — observed: fetches
+~60s apart are mostly refused, ~120s apart are fine. The cache file is shared
+by every caller (the hook in every session, the reader, anything polling
+`--json`), so `cache_seconds` is effectively the minimum spacing between live
+fetches across all of them. Two further rules keep a refusal from mattering:
+
+- **Stale fallback** — when a live fetch fails (429, network), the last good
+  reading is served instead as long as it is younger than
+  `max_stale_seconds`. `--json` marks it `"stale": true` with the reason in
+  `"fetch_error"`. The brake keeps braking on it rather than going blind.
+- **Backoff** — a failed fetch is remembered for `failure_backoff_seconds`,
+  and no caller retries during that time.
+
+An auth failure (no token, expired token, 401/403) is never masked by either:
+it surfaces immediately, since waiting will not fix it.
 
 ### Decision: `ask` vs `deny`
 
@@ -170,7 +188,9 @@ defaults):
   "fanout_floor_pct": 25.0,
   "fanout_tools": ["Agent", "Task", "Workflow"],
   "watch_kinds": ["session", "weekly_all", "weekly_scoped"],
-  "cache_seconds": 60,
+  "cache_seconds": 150,
+  "max_stale_seconds": 600,
+  "failure_backoff_seconds": 90,
   "decision": "ask",
   "lookback_fraction": 0.25,
   "history_retention_hours": 48.0,

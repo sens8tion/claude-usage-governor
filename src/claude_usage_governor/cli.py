@@ -60,6 +60,11 @@ STATE_DIR = Path(os.environ.get("CLAUDE_USAGE_GOVERNOR_HOME", CLAUDE_HOME / "usa
 CACHE_PATH = STATE_DIR / "cache.json"
 CONFIG_PATH = STATE_DIR / "config.json"
 HISTORY_PATH = STATE_DIR / "history.jsonl"
+FAILURE_PATH = STATE_DIR / "fetch-failure.json"
+
+# Fallbacks for get_usage() callers that don't pass the config values through.
+MAX_STALE_SECONDS = 600
+FAILURE_BACKOFF_SECONDS = 90
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # Below this much headroom on a watched window, throttle every tool.
@@ -70,8 +75,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Which limit kinds the brake watches. "session" is the 5h window.
     "watch_kinds": ["session", "weekly_all", "weekly_scoped"],
     # The brake must be cheap: a live call per tool use would be absurd, and
-    # the usage endpoint is itself rate-limitable.
-    "cache_seconds": 60,
+    # the usage endpoint is itself rate-limited -- observed to 429 fetches
+    # spaced ~60s apart while tolerating ~120s. The cache is shared by every
+    # caller (hook, reader, anything polling --json), so this is the minimum
+    # spacing between live fetches across all of them.
+    "cache_seconds": 150,
+    # When a live fetch fails (429, network), serve the last good reading
+    # instead, as long as it is younger than this. A reading a few minutes
+    # old is a far better sensor than none at all.
+    "max_stale_seconds": MAX_STALE_SECONDS,
+    # After a failed fetch, no caller tries again for this long -- retrying
+    # on every tool call only deepens a rate limit.
+    "failure_backoff_seconds": FAILURE_BACKOFF_SECONDS,
     # "ask" bounces the decision to you, via the normal permission prompt --
     # recoverable. "deny" is a hard block with NO in-session override: a
     # misconfigured floor strands every tool call, including the one that
@@ -122,6 +137,12 @@ class UsageError(RuntimeError):
     pass
 
 
+class AuthError(UsageError):
+    """The token itself is the problem. Waiting will not fix it, so this is
+    never papered over with a stale reading or a backoff -- it surfaces at
+    once."""
+
+
 # --------------------------------------------------------------------------- auth
 
 
@@ -133,12 +154,12 @@ def get_token() -> tuple[str, str]:
         return env, "CLAUDE_CODE_OAUTH_TOKEN"
 
     if not CRED_PATH.exists():
-        raise UsageError("no token; run: claude setup-token")
+        raise AuthError("no token; run: claude setup-token")
 
     oauth = json.loads(CRED_PATH.read_text(encoding="utf-8"))["claudeAiOauth"]
     expires = datetime.fromtimestamp(oauth["expiresAt"] / 1000, timezone.utc)
     if expires <= datetime.now(timezone.utc):
-        raise UsageError(
+        raise AuthError(
             f"stored CLI token expired {expires.astimezone():%Y-%m-%d %H:%M}; "
             "run: claude setup-token"
         )
@@ -164,9 +185,9 @@ def fetch_usage() -> dict[str, Any]:
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.load(resp)
     except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            raise UsageError(
-                "401 from /api/oauth/usage; token expired or lacks scope. "
+        if exc.code in (401, 403):
+            raise AuthError(
+                f"{exc.code} from /api/oauth/usage; token expired or lacks scope. "
                 "Run: claude setup-token"
             ) from exc
         raise UsageError(f"usage request failed: HTTP {exc.code}") from exc
@@ -176,25 +197,82 @@ def fetch_usage() -> dict[str, Any]:
     return {"data": data, "token_source": source, "fetched_at": time.time()}
 
 
-def get_usage(cache_seconds: int) -> dict[str, Any]:
-    if cache_seconds > 0 and CACHE_PATH.exists():
-        try:
-            cached = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-            if time.time() - cached["fetched_at"] < cache_seconds:
-                cached["from_cache"] = True
-                return cached
-        except (OSError, ValueError, KeyError):
-            pass  # a corrupt cache is not a reason to fail
+def _read_cache() -> dict[str, Any] | None:
+    try:
+        cached = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        float(cached["fetched_at"])
+        cached["data"]
+        return cached
+    except (OSError, ValueError, KeyError, TypeError):
+        return None  # a missing or corrupt cache is not a reason to fail
 
-    fresh = fetch_usage()
-    fresh["from_cache"] = False
-    if cache_seconds > 0:
+
+def _write_state(path: Path, obj: dict[str, Any]) -> None:
+    """Atomic (temp + replace): several processes share these files, and a
+    reader must never see a half-written one. Best-effort -- the cache is an
+    optimisation, not a requirement."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(obj), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _recent_failure(backoff_seconds: float) -> str | None:
+    """The error from the last failed fetch, if it is recent enough that no
+    caller should be retrying yet."""
+    try:
+        failure = json.loads(FAILURE_PATH.read_text(encoding="utf-8"))
+        if 0 <= time.time() - float(failure["failed_at"]) < backoff_seconds:
+            return str(failure["error"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def get_usage(cache_seconds: int, max_stale_seconds: float = MAX_STALE_SECONDS,
+              backoff_seconds: float = FAILURE_BACKOFF_SECONDS) -> dict[str, Any]:
+    """Cached reading if younger than `cache_seconds`, else a live fetch.
+
+    A failed fetch (429, network) is remembered for `backoff_seconds`, during
+    which no caller retries, and is answered with the last good reading as
+    long as that is younger than `max_stale_seconds` -- marked `stale`, with
+    the reason in `fetch_error`. Only when there is nothing recent enough to
+    stand in does the failure reach the caller. An AuthError always does.
+
+    `cache_seconds` of 0 means "always try live": it skips the fresh-cache
+    shortcut and the backoff, but still falls back to a stale reading."""
+    cached = _read_cache()
+    age = time.time() - cached["fetched_at"] if cached else None
+
+    if cached and cache_seconds > 0 and age < cache_seconds:
+        cached.update(from_cache=True, stale=False)
+        return cached
+
+    error = _recent_failure(backoff_seconds) if cache_seconds > 0 else None
+    if error is None:
         try:
-            CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CACHE_PATH.write_text(json.dumps(fresh), encoding="utf-8")
-        except OSError:
-            pass  # cache is an optimisation, not a requirement
-    return fresh
+            fresh = fetch_usage()
+        except AuthError:
+            raise
+        except UsageError as exc:
+            error = str(exc)
+            _write_state(FAILURE_PATH, {"failed_at": time.time(), "error": error})
+        else:
+            fresh.update(from_cache=False, stale=False)
+            _write_state(CACHE_PATH, fresh)
+            try:
+                FAILURE_PATH.unlink()
+            except OSError:
+                pass
+            return fresh
+
+    if cached and age < max_stale_seconds:
+        cached.update(from_cache=True, stale=True, fetch_error=error)
+        return cached
+    raise UsageError(error)
 
 
 # --------------------------------------------------------------------------- parse
@@ -470,7 +548,9 @@ def run_hook(config: dict[str, Any]) -> int:
     tool = payload.get("tool_name", "")
 
     try:
-        usage = get_usage(int(config["cache_seconds"]))
+        usage = get_usage(int(config["cache_seconds"]),
+                          max_stale_seconds=float(config["max_stale_seconds"]),
+                          backoff_seconds=float(config["failure_backoff_seconds"]))
         windows = extract_windows(usage["data"])
         if not usage["from_cache"]:
             # Keep collecting rate history even when only the hook runs, so
@@ -542,10 +622,18 @@ def main(argv: list[str] | None = None) -> int:
 
     cache = int(config["cache_seconds"]) if (args.json or args.quiet) else 0
     try:
-        usage = get_usage(cache)
+        usage = get_usage(cache,
+                          max_stale_seconds=float(config["max_stale_seconds"]),
+                          backoff_seconds=float(config["failure_backoff_seconds"]))
     except UsageError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    stale = bool(usage.get("stale"))
+    if stale and not args.json:
+        print(f"note: live fetch failed ({usage.get('fetch_error')}); showing the "
+              f"reading from {int(time.time() - usage['fetched_at'])}s ago",
+              file=sys.stderr)
 
     windows = extract_windows(usage["data"])
     if not windows:
@@ -566,6 +654,8 @@ def main(argv: list[str] | None = None) -> int:
             "token_source": usage["token_source"],
             "fetched_at": datetime.fromtimestamp(usage["fetched_at"], timezone.utc).isoformat(),
             "from_cache": usage["from_cache"],
+            "stale": stale,
+            "fetch_error": usage.get("fetch_error") if stale else None,
             "windows": windows,
             "lowest_remaining": binding["remaining"],
             "binding_window": binding["title"],

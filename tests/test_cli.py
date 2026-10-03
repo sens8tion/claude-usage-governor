@@ -175,7 +175,7 @@ def _usage_payload(percent: float) -> dict:
 
 
 def _invoke_hook(monkeypatch, capsys, tool_name: str, percent: float, config: dict):
-    monkeypatch.setattr(cli, "get_usage", lambda cache_seconds: _usage_payload(percent))
+    monkeypatch.setattr(cli, "get_usage", lambda cache_seconds, **kw: _usage_payload(percent))
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_name": tool_name})))
     rc = cli.run_hook(config)
     out = capsys.readouterr().out
@@ -226,7 +226,7 @@ def test_hook_fails_open_on_bad_stdin(monkeypatch, capsys):
 
 
 def test_hook_fails_open_when_usage_unavailable(monkeypatch, capsys):
-    def boom(cache_seconds):
+    def boom(cache_seconds, **kw):
         raise cli.UsageError("no token")
 
     monkeypatch.setattr(cli, "get_usage", boom)
@@ -234,6 +234,129 @@ def test_hook_fails_open_when_usage_unavailable(monkeypatch, capsys):
     rc = cli.run_hook(dict(cli.DEFAULT_CONFIG))
     assert rc == 0
     assert capsys.readouterr().out == ""
+
+
+# --------------------------------------------------------------------------- get_usage (cache, stale fallback, backoff)
+
+
+def _fresh_reading(percent: float = 10.0) -> dict:
+    return {"data": {"limits": [{"kind": "session", "percent": percent, "resets_at": None}]},
+            "token_source": "test", "fetched_at": cli.time.time()}
+
+
+@pytest.fixture
+def state(monkeypatch, tmp_path):
+    """Point the cache and failure marker at a temp dir, and count fetches."""
+    monkeypatch.setattr(cli, "CACHE_PATH", tmp_path / "cache.json")
+    monkeypatch.setattr(cli, "FAILURE_PATH", tmp_path / "fetch-failure.json")
+    calls = {"n": 0, "raises": None}
+
+    def fake_fetch():
+        calls["n"] += 1
+        if calls["raises"] is not None:
+            raise calls["raises"]
+        return _fresh_reading()
+
+    monkeypatch.setattr(cli, "fetch_usage", fake_fetch)
+    return calls
+
+
+def _seed_cache(age_seconds: float, percent: float = 42.0) -> None:
+    reading = _fresh_reading(percent)
+    reading["fetched_at"] -= age_seconds
+    cli.CACHE_PATH.write_text(json.dumps(reading), encoding="utf-8")
+
+
+def test_get_usage_fetches_and_caches(state):
+    usage = cli.get_usage(60)
+    assert usage["from_cache"] is False and usage["stale"] is False
+    again = cli.get_usage(60)
+    assert again["from_cache"] is True and again["stale"] is False
+    assert state["n"] == 1
+
+
+def test_get_usage_refetches_once_cache_expires(state):
+    _seed_cache(age_seconds=200)
+    usage = cli.get_usage(60)
+    assert usage["from_cache"] is False
+    assert state["n"] == 1
+
+
+def test_get_usage_serves_stale_cache_when_fetch_fails(state):
+    _seed_cache(age_seconds=200, percent=42.0)
+    state["raises"] = cli.UsageError("usage request failed: HTTP 429")
+    usage = cli.get_usage(60, max_stale_seconds=600)
+    assert usage["stale"] is True and usage["from_cache"] is True
+    assert usage["fetch_error"] == "usage request failed: HTTP 429"
+    assert usage["data"]["limits"][0]["percent"] == 42.0
+
+
+def test_get_usage_raises_when_cache_too_old_to_stand_in(state):
+    _seed_cache(age_seconds=5000)
+    state["raises"] = cli.UsageError("usage request failed: HTTP 429")
+    with pytest.raises(cli.UsageError, match="429"):
+        cli.get_usage(60, max_stale_seconds=600)
+
+
+def test_get_usage_raises_when_fetch_fails_and_no_cache(state):
+    state["raises"] = cli.UsageError("usage request failed: HTTP 429")
+    with pytest.raises(cli.UsageError, match="429"):
+        cli.get_usage(60)
+
+
+def test_get_usage_backs_off_after_a_failure(state):
+    _seed_cache(age_seconds=200)
+    state["raises"] = cli.UsageError("usage request failed: HTTP 429")
+    cli.get_usage(60, backoff_seconds=90)
+    cli.get_usage(60, backoff_seconds=90)
+    cli.get_usage(60, backoff_seconds=90)
+    assert state["n"] == 1  # the failure was remembered; no retry storm
+
+
+def test_get_usage_retries_once_backoff_elapses(state):
+    _seed_cache(age_seconds=200)
+    cli.FAILURE_PATH.write_text(
+        json.dumps({"failed_at": cli.time.time() - 500, "error": "old"}), encoding="utf-8")
+    usage = cli.get_usage(60, backoff_seconds=90)
+    assert usage["from_cache"] is False
+    assert state["n"] == 1
+    assert not cli.FAILURE_PATH.exists()  # a success clears the marker
+
+
+def test_get_usage_cache_zero_ignores_backoff_but_still_falls_back(state):
+    _seed_cache(age_seconds=30)
+    state["raises"] = cli.UsageError("usage request failed: HTTP 429")
+    cli.get_usage(10, backoff_seconds=90)  # 30s-old cache is past 10s -> fails, marks
+    usage = cli.get_usage(0, backoff_seconds=90)     # always-live: tries again anyway
+    assert state["n"] == 2
+    assert usage["stale"] is True
+
+
+def test_get_usage_auth_error_is_never_masked_by_cache(state):
+    _seed_cache(age_seconds=200)
+    state["raises"] = cli.AuthError("stored CLI token expired")
+    with pytest.raises(cli.AuthError):
+        cli.get_usage(60)
+    assert not cli.FAILURE_PATH.exists()  # and it does not start a backoff
+
+
+def test_get_usage_corrupt_cache_is_ignored(state):
+    cli.CACHE_PATH.write_text("{not json", encoding="utf-8")
+    usage = cli.get_usage(60)
+    assert usage["from_cache"] is False
+
+
+def test_hook_still_brakes_on_a_stale_reading(state, monkeypatch, capsys):
+    """A 429 must not blind the brake while a recent reading exists."""
+    monkeypatch.setattr(cli, "HISTORY_PATH", cli.CACHE_PATH.parent / "history.jsonl")
+    _seed_cache(age_seconds=200, percent=97.0)  # 3% left
+    state["raises"] = cli.UsageError("usage request failed: HTTP 429")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_name": "Bash"})))
+    rc = cli.run_hook(dict(cli.DEFAULT_CONFIG))
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert out["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert not (cli.CACHE_PATH.parent / "history.jsonl").exists()  # stale != a new sample
 
 
 # --------------------------------------------------------------------------- rate history
