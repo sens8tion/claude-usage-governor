@@ -109,6 +109,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # the math, misleading in practice, since a fan-out burst can spike well
     # above any trailing average before the next sample catches it.
     "fanout_multiplier_cap": 4.0,
+    # Human names for the dollar credit balances the API reports under opaque
+    # codenames, e.g. {"some_codename": "Cloud credit"}. See extract_credits.
+    "credit_titles": {},
 }
 
 WINDOW_TITLES = {
@@ -345,6 +348,65 @@ def extract_windows(data: dict[str, Any]) -> list[dict[str, Any]]:
     return windows
 
 
+CREDIT_ADVICE = (
+    "Work could run against this credit instead of plan headroom. Propose "
+    "that to the user -- never move work there without their approval."
+)
+
+
+def extract_credits(data: dict[str, Any], titles: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """Dollar-denominated credit balances (a granted or promotional pot of
+    money), found as any top-level entry carrying `limit_dollars`. The API
+    names these with opaque codenames, so `titles` (config `credit_titles`)
+    maps a key to something a human recognises.
+
+    Kept apart from `extract_windows` on purpose: a credit is somewhere else
+    work could be paid for, not plan headroom, and it is never an input to
+    the brake's decision. It is surfaced so a session KNOWS the option exists
+    and can propose it -- see CREDIT_ADVICE."""
+    credits = []
+    for key, val in data.items():
+        if not isinstance(val, dict) or val.get("limit_dollars") is None:
+            continue
+        try:
+            limit = float(val["limit_dollars"])
+            used = float(val.get("used_dollars") or 0.0)
+            remaining = val.get("remaining_dollars")
+            remaining = float(remaining) if remaining is not None else max(0.0, limit - used)
+        except (TypeError, ValueError):
+            continue
+
+        # What it takes to use the credit up before it resets -- unspent
+        # credit is simply lost at that point.
+        per_day = None
+        try:
+            reset = parse_reset(val.get("resets_at"))
+            if reset is not None and remaining > 0:
+                days = (reset - datetime.now(timezone.utc)).total_seconds() / 86400
+                if days > 0:
+                    per_day = round(remaining / max(days, 1.0), 2)
+        except (TypeError, ValueError):
+            pass
+
+        usable = remaining > 0 and not val.get("locked_reason")
+        credits.append(
+            {
+                "key": key,
+                "title": (titles or {}).get(key) or f"Credit ({key})",
+                "limit_dollars": limit,
+                "used_dollars": used,
+                "remaining_dollars": remaining,
+                "percent": round(100.0 * used / limit, 1) if limit > 0 else 0.0,
+                "resets_at": val.get("resets_at"),
+                "locked_reason": val.get("locked_reason"),
+                "usable": usable,
+                "spend_per_day_to_use_up": per_day,
+                "advice": CREDIT_ADVICE if usable else None,
+            }
+        )
+    return credits
+
+
 def countdown(resets_at: Any) -> str | None:
     reset = parse_reset(resets_at)
     if reset is None:
@@ -488,7 +550,8 @@ def load_config() -> dict[str, Any]:
 # --------------------------------------------------------------------------- report
 
 
-def report(windows: list[dict[str, Any]], data: dict[str, Any], colour: bool) -> None:
+def report(windows: list[dict[str, Any]], data: dict[str, Any], colour: bool,
+           credits: list[dict[str, Any]] | None = None) -> None:
     def paint(text: str, code: str) -> str:
         return f"\033[{code}m{text}\033[0m" if colour else text
 
@@ -519,6 +582,26 @@ def report(windows: list[dict[str, Any]], data: dict[str, Any], colour: bool) ->
                 f"  rate: {proj['rate_pct_per_hour']:.2f}%/h of {proj['sustainable_rate_pct_per_hour']:.2f}%/h "
                 f"sustainable - at this rate you {hit} (~{proj['projected_steady_state_pct']:.0f}% "
                 f"steady-state) - fan-out up to {proj['fanout_multiplier']:.1f}x", "90"))
+        print()
+
+    for c in credits or []:
+        filled = round(min(100.0, c["percent"]) / 100 * width)
+        bar = "#" * filled + "." * (width - filled)
+        print(paint(c["title"], "36"))
+        print(f"  [{bar}] ${c['remaining_dollars']:,.2f} left of ${c['limit_dollars']:,.2f}"
+              f"  ({c['percent']:.1f}% used)")
+        left = countdown(c["resets_at"])
+        if left:
+            reset = parse_reset(c["resets_at"]).astimezone()
+            line = f"  resets {reset:%a %d %b %H:%M} - in {left}"
+            if c["spend_per_day_to_use_up"]:
+                line += f" - ${c['spend_per_day_to_use_up']:,.2f}/day would use it up by then"
+            print(paint(line, "90"))
+        if c["locked_reason"]:
+            print(paint(f"  locked: {c['locked_reason']}", "90"))
+        elif c["usable"]:
+            print(paint("  unused credit: work could run against this instead of plan "
+                        "headroom (needs your approval)", "33"))
         print()
 
     extra = data.get("extra_usage")
@@ -588,6 +671,20 @@ def run_hook(config: dict[str, Any]) -> int:
             f"out to {tool}; parallel agents burn the 5h window fastest."
         )
 
+    # The floor decision above never looks at credit. But a session being
+    # throttled should know there is somewhere else the work could go.
+    try:
+        for c in extract_credits(usage["data"], config.get("credit_titles")):
+            if c["usable"]:
+                reason += (
+                    f" {c['title']}: ${c['remaining_dollars']:,.0f} of "
+                    f"${c['limit_dollars']:,.0f} unused -- this work could run against "
+                    f"that instead. Propose it to the user; do not move work there "
+                    f"without their approval."
+                )
+    except Exception:
+        pass  # advisory only; must never break the hook
+
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -646,9 +743,10 @@ def main(argv: list[str] | None = None) -> int:
     enrich_with_projections(windows, config, time.time())
 
     binding = min(windows, key=lambda w: w["remaining"])
+    credits = extract_credits(usage["data"], config.get("credit_titles"))
 
     if args.json:
-        for w in windows:
+        for w in windows + credits:
             w["resets_in"] = countdown(w["resets_at"])
         print(json.dumps({
             "token_source": usage["token_source"],
@@ -657,6 +755,7 @@ def main(argv: list[str] | None = None) -> int:
             "stale": stale,
             "fetch_error": usage.get("fetch_error") if stale else None,
             "windows": windows,
+            "credits": credits,
             "lowest_remaining": binding["remaining"],
             "binding_window": binding["title"],
             "binding_kind": binding["kind"],
@@ -669,7 +768,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{f', resets in {left}' if left else ''})")
         return 0
 
-    report(windows, usage["data"], colour=sys.stdout.isatty())
+    report(windows, usage["data"], colour=sys.stdout.isatty(), credits=credits)
     return 0
 
 

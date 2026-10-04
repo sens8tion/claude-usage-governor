@@ -136,6 +136,82 @@ def test_extract_windows_empty_when_no_data():
     assert cli.extract_windows({}) == []
 
 
+# --------------------------------------------------------------------------- extract_credits
+
+
+def _credit(**over) -> dict:
+    base = {"utilization": 0.0, "limit_dollars": 250, "used_dollars": 0.0,
+            "remaining_dollars": 250.0, "locked_reason": None,
+            "resets_at": (datetime.now(timezone.utc) + timedelta(days=25)).isoformat()}
+    base.update(over)
+    return base
+
+
+def test_extract_credits_finds_dollar_buckets_only():
+    data = {
+        "some_codename": _credit(),
+        # plan windows carry null dollars -- not credits
+        "five_hour": {"utilization": 12.0, "limit_dollars": None, "resets_at": None},
+        "limits": [{"kind": "session", "percent": 12}],
+        "extra_usage": {"is_enabled": False, "monthly_limit": 2000},
+    }
+    credits = cli.extract_credits(data)
+    assert [c["key"] for c in credits] == ["some_codename"]
+    c = credits[0]
+    assert c["remaining_dollars"] == 250.0 and c["percent"] == 0.0
+    assert c["usable"] is True and c["advice"] == cli.CREDIT_ADVICE
+    assert c["spend_per_day_to_use_up"] == pytest.approx(10.0, abs=0.1)  # 250 over 25 days
+
+
+def test_extract_credits_uses_configured_title():
+    data = {"some_codename": _credit()}
+    assert cli.extract_credits(data)[0]["title"] == "Credit (some_codename)"
+    titled = cli.extract_credits(data, {"some_codename": "Cloud credit"})
+    assert titled[0]["title"] == "Cloud credit"
+
+
+def test_extract_credits_spent_or_locked_is_not_usable():
+    spent = cli.extract_credits({"k": _credit(used_dollars=250.0, remaining_dollars=0.0)})[0]
+    assert spent["usable"] is False and spent["advice"] is None
+    assert spent["spend_per_day_to_use_up"] is None
+    locked = cli.extract_credits({"k": _credit(locked_reason="expired")})[0]
+    assert locked["usable"] is False
+
+
+def test_extract_credits_never_become_windows():
+    """Credit is not plan headroom -- the brake must not see it as a window."""
+    data = {"some_codename": _credit(), "limits": [{"kind": "session", "percent": 10}]}
+    assert [w["kind"] for w in cli.extract_windows(data)] == ["session"]
+
+
+def test_extract_credits_tolerates_malformed_values():
+    data = {"bad": _credit(limit_dollars="lots"), "odd_reset": _credit(resets_at="not a date")}
+    credits = cli.extract_credits(data)
+    assert [c["key"] for c in credits] == ["odd_reset"]
+    assert credits[0]["spend_per_day_to_use_up"] is None
+
+
+def test_hook_mentions_unused_credit_when_throttling(monkeypatch, capsys):
+    payload = _usage_payload(97.0)  # 3% left -> throttled
+    payload["data"]["some_codename"] = _credit()
+    monkeypatch.setattr(cli, "get_usage", lambda cache_seconds, **kw: payload)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_name": "Bash"})))
+    config = dict(cli.DEFAULT_CONFIG, credit_titles={"some_codename": "Cloud credit"})
+    cli.run_hook(config)
+    reason = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "Cloud credit: $250 of $250 unused" in reason
+    assert "without their approval" in reason
+
+
+def test_hook_stays_silent_about_credit_when_not_throttling(monkeypatch, capsys):
+    payload = _usage_payload(10.0)
+    payload["data"]["some_codename"] = _credit()
+    monkeypatch.setattr(cli, "get_usage", lambda cache_seconds, **kw: payload)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_name": "Bash"})))
+    assert cli.run_hook(dict(cli.DEFAULT_CONFIG)) == 0
+    assert capsys.readouterr().out == ""  # credit never causes a throttle by itself
+
+
 # --------------------------------------------------------------------------- load_config
 
 

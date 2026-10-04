@@ -123,6 +123,33 @@ widen your default," never as a substitute for the hard-floor brake, which
 stays purely reactive and unaffected by any of this (see
 [Wiring in the hook](#wiring-in-the-hook)).
 
+## Credit balances: somewhere else the work could go
+
+If your account holds a dollar credit (a granted or promotional pot), the
+usage endpoint reports it alongside the rate-limit windows, and so does this
+tool — as a separate `credits` list, never mixed into the windows:
+
+```
+Cloud credit
+  [............................] $250.00 left of $250.00  (0.0% used)
+  resets Thu 05 Nov 07:59 - in 31d 9h - $7.97/day would use it up by then
+  unused credit: work could run against this instead of plan headroom (needs your approval)
+```
+
+`--json` carries the same per credit: `remaining_dollars`, `percent`,
+`resets_at`, `spend_per_day_to_use_up` (unspent credit is lost at the reset),
+`usable`, and an `advice` string. The API names these balances with opaque
+codenames; give yours a real name with `credit_titles` in the config.
+
+Two rules, both deliberate:
+
+- **Credit is not headroom.** It never raises or lowers the brake's floors.
+  The hook only *mentions* a usable credit in its message when it is already
+  throttling for another reason.
+- **Suggest, never move.** The tool, and any session reading it, says that
+  work *could* run against the credit. Actually moving work there spends the
+  user's money and is their decision, per workload.
+
 ## Wiring in the hook
 
 Add to `~/.claude/settings.json` (see
@@ -194,7 +221,8 @@ defaults):
   "decision": "ask",
   "lookback_fraction": 0.25,
   "history_retention_hours": 48.0,
-  "fanout_multiplier_cap": 4.0
+  "fanout_multiplier_cap": 4.0,
+  "credit_titles": {}
 }
 ```
 
@@ -215,6 +243,10 @@ defaults):
 - **`fanout_multiplier_cap`** — ceiling on the reported fan-out multiplier,
   so a very low or still-thin measured rate doesn't project an enormous or
   unbounded number.
+
+- **`credit_titles`** — maps a credit balance's API codename to a name you
+  recognise, e.g. `{"some_codename": "Cloud credit"}`. Untitled credits show
+  as `Credit (<codename>)`.
 
 The hook's own throttle decision (above) stays purely floor-based and does
 **not** consume the rate projection — it only records history in the

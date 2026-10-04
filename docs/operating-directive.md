@@ -78,6 +78,24 @@ narrow your default, never to override the hook's hard floor, and never as a
 reason to skip a `remaining`-based check just because a stale projection once
 looked healthy.
 
+## Credit: say when work could go there, never move it yourself
+
+`--json` also carries a `credits` list — dollar balances the user holds
+outside the plan's rate-limit windows (for instance a cloud credit). At every
+headroom check, look at it too. For each credit with `usable: true`:
+
+- When the next unit of work is heavy, long-running or fan-out — or you are
+  in the throttled band or worse — **say so plainly**: name the credit, its
+  `remaining_dollars`, and that this work could run against it instead of
+  plan headroom. If `spend_per_day_to_use_up` shows the credit will lapse
+  largely unspent at its reset, say that as well; unspent credit is lost.
+- **Never move, launch or re-route work onto the credit yourself.** Spending
+  it is the user's decision, per workload. Propose, wait for an explicit
+  yes for that piece of work, and carry on within your band on the plan in
+  the meantime. A yes for one workload is not a yes for the next.
+- Credit does not change your band. It is an alternative place to run work,
+  not extra headroom — never count it toward `lowest_remaining`.
+
 ## Model selection: least viable, not cheapest by default
 
 For every subagent or Workflow `agent()` call, ask: what is the cheapest tier
