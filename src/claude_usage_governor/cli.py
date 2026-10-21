@@ -164,7 +164,8 @@ def get_token() -> tuple[str, str]:
     if expires <= datetime.now(timezone.utc):
         raise AuthError(
             f"stored CLI token expired {expires.astimezone():%Y-%m-%d %H:%M}; "
-            "run: claude setup-token"
+            "run: claude setup-token (or, in the Claude desktop app, pass the "
+            "session's get_usage result to --ingest)"
         )
     return oauth["accessToken"], str(CRED_PATH)
 
@@ -198,6 +199,59 @@ def fetch_usage() -> dict[str, Any]:
         raise UsageError(f"usage request failed: {exc}") from exc
 
     return {"data": data, "token_source": source, "fetched_at": time.time()}
+
+
+# --------------------------------------------------------------------------- the app's own reading
+
+APP_SOURCE = "claude-app get_usage"
+
+
+def from_app_usage(reading: dict[str, Any]) -> dict[str, Any]:
+    """The Claude desktop app reads the same plan limits natively: its session
+    tool `get_usage` returns `plan.windows` as labelled percentages. This turns
+    that into the `limits` shape `extract_windows` already reads, so a session
+    in the app can hand the governor a reading when the CLI token has expired.
+    Accepts the whole tool result or just its `plan`."""
+    plan = reading["plan"] if isinstance(reading.get("plan"), dict) else reading   # inside, "plan" is the plan's name
+    if plan.get("status") != "ok":
+        raise UsageError(f"the app could not read plan limits ({plan.get('status')}): "
+                         f"{plan.get('note') or 'no detail'}")
+    limits = []
+    for w in plan.get("windows") or []:
+        label = str(w.get("label") or "")
+        lower = label.lower()
+        if "5-hour" in lower or "session" in lower:
+            kind, group, scope = "session", "session", None
+        elif "all models" in lower:
+            kind, group, scope = "weekly_all", "weekly", None
+        elif "weekly" in lower:
+            model = label.split("·", 1)[-1].strip() if "·" in label else None
+            kind, group = "weekly_scoped", "weekly"
+            scope = {"model": {"display_name": model}} if model else None
+        else:
+            continue
+        lim = {"kind": kind, "group": group, "percent": w.get("percentUsed"),
+               "resets_at": w.get("resetsAt"), "severity": None, "is_active": None}
+        if scope:
+            lim["scope"] = scope
+        limits.append(lim)
+    if not limits:
+        raise UsageError("the app's reading has no plan windows in it")
+    return {"limits": limits}
+
+
+def ingest_app_usage(text: str, retention_hours: float) -> dict[str, Any]:
+    """Store a reading from the app as the latest one: the cache (so `--json`
+    and the hook use it), and the history (so projections keep their rate)."""
+    usage = {"data": from_app_usage(json.loads(text)), "token_source": APP_SOURCE,
+             "fetched_at": time.time()}
+    _write_state(CACHE_PATH, usage)
+    try:
+        FAILURE_PATH.unlink()
+    except OSError:
+        pass
+    record_history(extract_windows(usage["data"]), retention_hours, usage["fetched_at"])
+    return usage
 
 
 def _read_cache() -> dict[str, Any] | None:
@@ -258,7 +312,12 @@ def get_usage(cache_seconds: int, max_stale_seconds: float = MAX_STALE_SECONDS,
     if error is None:
         try:
             fresh = fetch_usage()
-        except AuthError:
+        except AuthError as exc:
+            # waiting will not fix the token, but a recent reading from the app
+            # (`--ingest`) is as good as a live one while it is young enough
+            if cached and cached.get("token_source") == APP_SOURCE and age < max_stale_seconds:
+                cached.update(from_cache=True, stale=True, fetch_error=str(exc))
+                return cached
             raise
         except UsageError as exc:
             error = str(exc)
@@ -708,16 +767,27 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--hook", action="store_true", help="run as a PreToolUse hook")
     parser.add_argument("--cache-seconds", type=int, default=None,
                         help="serve from cache if younger than this (0 = always live)")
+    parser.add_argument("--ingest", metavar="FILE",
+                        help="take the reading from the Claude app's get_usage tool (a JSON file, "
+                             "or - for stdin) instead of the CLI token, then report as usual")
     args = parser.parse_args(argv)
 
     config = load_config()
     if args.cache_seconds is not None:
         config["cache_seconds"] = args.cache_seconds
+    if args.ingest:
+        try:
+            text = sys.stdin.read() if args.ingest == "-" else Path(args.ingest).read_text(encoding="utf-8")
+            ingest_app_usage(text, float(config["history_retention_hours"]))
+        except (OSError, ValueError, UsageError) as exc:
+            print(f"error: could not take the app's reading: {exc}", file=sys.stderr)
+            return 1
+        config["cache_seconds"] = max(int(config["cache_seconds"]), 60)
 
     if args.hook:
         return run_hook(config)
 
-    cache = int(config["cache_seconds"]) if (args.json or args.quiet) else 0
+    cache = int(config["cache_seconds"]) if (args.json or args.quiet or args.ingest) else 0
     try:
         usage = get_usage(cache,
                           max_stale_seconds=float(config["max_stale_seconds"]),

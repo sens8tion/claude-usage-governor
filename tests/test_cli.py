@@ -609,3 +609,73 @@ def test_enrich_with_projections_none_when_kind_unknown(monkeypatch, tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------------------------- the app's reading (--ingest)
+
+
+APP_READING = {
+    "plan": {
+        "status": "ok",
+        "plan": "Max",
+        "windows": [
+            {"label": "5-hour limit", "percentUsed": 1, "resetsAt": "2026-10-21T06:49:59.886Z"},
+            {"label": "Weekly · all models", "percentUsed": 11, "resetsAt": "2026-10-27T02:59:59.886Z"},
+            {"label": "Weekly · Fable", "percentUsed": 2, "resetsAt": "2026-10-27T02:59:59.886Z"},
+        ],
+        "extraUsage": {"enabled": False, "percentUsed": 0},
+    },
+    "context": {"session": "self", "status": "ok", "percentUsed": 23},
+}
+
+
+def test_from_app_usage_maps_windows():
+    windows = cli.extract_windows(cli.from_app_usage(APP_READING))
+    by_kind = {w["kind"]: w for w in windows}
+    assert by_kind["session"]["remaining"] == 99.0
+    assert by_kind["weekly_all"]["remaining"] == 89.0
+    assert by_kind["weekly_scoped"]["title"] == "Current week (Fable only)"
+    assert len(windows) == 3  # extra usage is spend, never a window
+
+
+def test_from_app_usage_accepts_plan_alone():
+    assert cli.from_app_usage(APP_READING["plan"]) == cli.from_app_usage(APP_READING)
+
+
+def test_from_app_usage_refuses_unavailable():
+    with pytest.raises(cli.UsageError):
+        cli.from_app_usage({"plan": {"status": "unavailable", "note": "try again"}})
+
+
+def _state_in(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "CACHE_PATH", tmp_path / "cache.json")
+    monkeypatch.setattr(cli, "FAILURE_PATH", tmp_path / "failure.json")
+    monkeypatch.setattr(cli, "HISTORY_PATH", tmp_path / "history.json")
+
+
+def test_ingest_becomes_the_cached_reading(monkeypatch, tmp_path):
+    _state_in(monkeypatch, tmp_path)
+    cli.ingest_app_usage(json.dumps(APP_READING), 48)
+    usage = cli.get_usage(150)
+    assert usage["token_source"] == cli.APP_SOURCE and usage["from_cache"] is True
+
+
+def test_expired_token_falls_back_to_recent_app_reading(monkeypatch, tmp_path):
+    _state_in(monkeypatch, tmp_path)
+    cli.ingest_app_usage(json.dumps(APP_READING), 48)
+
+    def expired():
+        raise cli.AuthError("stored CLI token expired")
+    monkeypatch.setattr(cli, "fetch_usage", expired)
+    usage = cli.get_usage(0)  # always live: the token fails, the app reading stands in
+    assert usage["stale"] is True and usage["token_source"] == cli.APP_SOURCE
+
+
+def test_expired_token_still_surfaces_without_app_reading(monkeypatch, tmp_path):
+    _state_in(monkeypatch, tmp_path)
+
+    def expired():
+        raise cli.AuthError("stored CLI token expired")
+    monkeypatch.setattr(cli, "fetch_usage", expired)
+    with pytest.raises(cli.AuthError):
+        cli.get_usage(0)

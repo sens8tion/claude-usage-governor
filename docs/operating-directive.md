@@ -14,6 +14,17 @@ subagents (Agent/Workflow) — check current plan headroom:
 
     claude-usage-governor --json
 
+In the Claude desktop app, read it natively instead of relying on the CLI
+token: call the session tool `get_usage` (it returns the same plan limits the
+app's usage card shows), write its result to a file, and pass that in:
+
+    claude-usage-governor --ingest <file> --json
+
+That reading becomes the governor's latest one (cache and rate history), so
+the hook and later `--json` calls use it too, and an expired CLI token falls
+back to it for up to ten minutes. Use this route whenever `get_usage` is
+available, and whenever `--json` reports an expired token.
+
 Read `lowest_remaining` (the binding window's headroom) and `binding_window`
 (which limit — the 5h session window or the 7-day weekly window — is closer
 to empty). The 5h window SLIDES: headroom returns continuously as old usage
