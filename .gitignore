@@ -6,3 +6,9 @@ venv/
 *.egg-info/
 build/
 dist/
+
+# opsec: values never land on disk; references may
+.env
+.env.*
+!.env.op
+!.env.*.op
